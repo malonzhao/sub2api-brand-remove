@@ -1,0 +1,10 @@
+# 构建期临时拉取的上游源码，绝不入库
+/upstream/
+
+# 本地试跑产物
+/.debrand-work/
+
+__pycache__/
+*.pyc
+.DS_Store
+.claude

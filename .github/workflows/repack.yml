@@ -1,0 +1,274 @@
+name: Repack upstream release
+
+# 每 6 小时检测一次上游最新正式发布，未打包过则去品牌改写后重新打包发布到本仓库。
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '上游 tag（留空则取上游最新正式发布）'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: repack
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: Wei-Shaw/sub2api
+
+jobs:
+  repack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout pipeline
+        uses: actions/checkout@v6
+        with:
+          path: pipeline
+
+      # ---------- 版本检测 ----------
+      - name: Resolve upstream release
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${INPUT_TAG}" ]; then
+            TAG="${INPUT_TAG}"
+            echo "手动指定上游 tag: ${TAG}"
+            # 上游不存在该 release 时 gh api 返回非零，直接让本步骤失败
+            gh api "repos/${UPSTREAM_REPO}/releases/tags/${TAG}" > "${RUNNER_TEMP}/upstream_release.json"
+          else
+            gh api "repos/${UPSTREAM_REPO}/releases/latest" > "${RUNNER_TEMP}/upstream_release.json"
+            TAG=$(jq -r '.tag_name' "${RUNNER_TEMP}/upstream_release.json")
+            echo "上游最新正式发布: ${TAG}"
+          fi
+
+          if [ -z "${TAG}" ] || [ "${TAG}" = "null" ]; then
+            echo "::error::未能解析上游 tag"
+            exit 1
+          fi
+
+          jq -r '.body // ""' "${RUNNER_TEMP}/upstream_release.json" > "${RUNNER_TEMP}/upstream_body.md"
+
+          {
+            echo "tag=${TAG}"
+            echo "version=${TAG#v}"
+          } >> "$GITHUB_OUTPUT"
+
+      # ---------- 幂等判定 ----------
+      - name: Check whether already repacked
+        id: idem
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          set -euo pipefail
+          EXISTS=false
+
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            EXISTS=true
+            echo "本仓库已存在 Release ${TAG}"
+          elif git ls-remote --tags "https://github.com/${GITHUB_REPOSITORY}.git" "refs/tags/${TAG}" | grep -q .; then
+            EXISTS=true
+            echo "本仓库已存在 tag ${TAG}"
+          fi
+
+          if [ "${EXISTS}" = "true" ]; then
+            echo "::notice::${TAG} 已打包过，跳过本次运行"
+          else
+            echo "${TAG} 尚未打包，继续"
+          fi
+          echo "exists=${EXISTS}" >> "$GITHUB_OUTPUT"
+
+      # ---------- 拉取上游并改写 ----------
+      - name: Clone upstream at tag
+        id: clone
+        if: steps.idem.outputs.exists == 'false'
+        env:
+          TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${TAG}" \
+            "https://github.com/${UPSTREAM_REPO}.git" upstream
+          echo "commit=$(git -C upstream rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Debrand upstream working copy
+        if: steps.idem.outputs.exists == 'false'
+        run: |
+          set -euo pipefail
+          python3 pipeline/scripts/debrand.py \
+            --upstream upstream \
+            --repo "${GITHUB_REPOSITORY}"
+
+      - name: Write VERSION file
+        if: steps.idem.outputs.exists == 'false'
+        env:
+          VERSION: ${{ steps.upstream.outputs.version }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "${VERSION}" > upstream/backend/cmd/server/VERSION
+          echo "VERSION 文件写入: $(cat upstream/backend/cmd/server/VERSION)"
+
+      # ---------- 前端构建（产物内嵌进二进制，必须先于 Go 构建）----------
+      - name: Setup pnpm
+        if: steps.idem.outputs.exists == 'false'
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        if: steps.idem.outputs.exists == 'false'
+        uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+          cache-dependency-path: upstream/frontend/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        if: steps.idem.outputs.exists == 'false'
+        run: pnpm install --frozen-lockfile
+        working-directory: upstream/frontend
+
+      - name: Build frontend
+        if: steps.idem.outputs.exists == 'false'
+        run: pnpm run build
+        working-directory: upstream/frontend
+
+      - name: Assert frontend dist exists
+        if: steps.idem.outputs.exists == 'false'
+        run: |
+          set -euo pipefail
+          DIST=upstream/backend/internal/web/dist
+          if [ ! -d "${DIST}" ] || [ -z "$(ls -A "${DIST}")" ]; then
+            echo "::error::前端产物 ${DIST} 未生成"
+            exit 1
+          fi
+          echo "前端产物文件数: $(find "${DIST}" -type f | wc -l)"
+
+      - name: Verify debranding in built assets
+        if: steps.idem.outputs.exists == 'false'
+        run: python3 pipeline/scripts/debrand.py --upstream upstream --verify-dist
+
+      # ---------- 打包与发布 ----------
+      - name: Setup Go
+        if: steps.idem.outputs.exists == 'false'
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: upstream/backend/go.mod
+          cache-dependency-path: upstream/backend/go.sum
+
+      - name: Set up QEMU
+        if: steps.idem.outputs.exists == 'false'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        if: steps.idem.outputs.exists == 'false'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        if: steps.idem.outputs.exists == 'false'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compose release notes
+        if: steps.idem.outputs.exists == 'false'
+        env:
+          TAG: ${{ steps.upstream.outputs.tag }}
+          UPSTREAM_COMMIT: ${{ steps.clone.outputs.commit }}
+        run: |
+          set -euo pipefail
+          DELIM="DEBRAND_EOF_${GITHUB_RUN_ID}"
+          {
+            echo "TAG_MESSAGE<<${DELIM}"
+            echo "> 本版本由自动流水线基于上游 [\`${UPSTREAM_REPO}\` ${TAG}](https://github.com/${UPSTREAM_REPO}/releases/tag/${TAG})（commit \`${UPSTREAM_COMMIT}\`）重新打包。"
+            echo ">"
+            echo "> - 已移除前端指向上游仓库的 GitHub 入口（首页页脚、用量页页脚、右上角下拉导航）"
+            echo "> - 在线更新检测、回滚列表与产物下载已改为指向本仓库"
+            echo "> - 改动内容见本仓库 \`scripts/debrand.py\`；上游以 LGPL-3.0 授权，归档内保留原始 LICENSE"
+            echo "> - 下方 \"One-line install\" 一键安装命令来自上游模板，本仓库不携带 \`deploy/\` 目录，该命令不适用"
+            echo ""
+            echo "---"
+            echo ""
+            cat "${RUNNER_TEMP}/upstream_body.md"
+            echo "${DELIM}"
+          } >> "$GITHUB_ENV"
+
+      - name: Resolve repository identifiers
+        id: repo
+        if: steps.idem.outputs.exists == 'false'
+        run: |
+          set -euo pipefail
+          {
+            echo "owner_lower=$(echo "${GITHUB_REPOSITORY%%/*}" | tr '[:upper:]' '[:lower:]')"
+            echo "name=${GITHUB_REPOSITORY#*/}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run GoReleaser
+        if: steps.idem.outputs.exists == 'false'
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          version: '~> v2'
+          workdir: upstream
+          # 工作副本被改写过（dirty tree），必须跳过 validate
+          args: release --clean --skip=validate
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPO_OWNER: ${{ github.repository_owner }}
+          GITHUB_REPO_OWNER_LOWER: ${{ steps.repo.outputs.owner_lower }}
+          GITHUB_REPO_NAME: ${{ steps.repo.outputs.name }}
+          DOCKERHUB_USERNAME: skip
+
+      # ---------- 发布后校验 ----------
+      - name: Assert release assets
+        if: steps.idem.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.upstream.outputs.tag }}
+          VERSION: ${{ steps.upstream.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" \
+            --json assets --jq '.assets[].name' | sort > "${RUNNER_TEMP}/assets.txt"
+
+          echo "已发布产物:"
+          sed 's/^/  /' "${RUNNER_TEMP}/assets.txt"
+
+          MISSING=0
+          for NAME in \
+            "sub2api_${VERSION}_linux_amd64.tar.gz" \
+            "sub2api_${VERSION}_linux_arm64.tar.gz" \
+            "sub2api_${VERSION}_darwin_amd64.tar.gz" \
+            "sub2api_${VERSION}_darwin_arm64.tar.gz" \
+            "sub2api_${VERSION}_windows_amd64.zip" \
+            "checksums.txt" ; do
+            if ! grep -Fxq "${NAME}" "${RUNNER_TEMP}/assets.txt"; then
+              echo "::error::缺少产物 ${NAME}"
+              MISSING=1
+            fi
+          done
+          [ "${MISSING}" -eq 0 ]
+
+      - name: Summary
+        if: always() && steps.idem.outputs.exists == 'false'
+        env:
+          TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          {
+            echo "## 重打包 ${TAG}"
+            echo ""
+            echo "- 上游: \`${UPSTREAM_REPO}\` @ \`${{ steps.clone.outputs.commit }}\`"
+            echo "- Release: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+            echo "- 镜像: \`ghcr.io/${{ steps.repo.outputs.owner_lower }}/sub2api:${TAG#v}\`（同时更新 \`latest\`）"
+          } >> "$GITHUB_STEP_SUMMARY"
