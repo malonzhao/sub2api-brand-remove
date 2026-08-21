@@ -9,6 +9,7 @@
 - 新增定时工作流：每 6 小时检测一次上游 `releases/latest`，若本仓库尚无同名 tag 则触发一次重打包；同时支持 `workflow_dispatch` 手动指定 tag 回补历史版本。
 - 新增去品牌补丁脚本，在构建前对上游工作副本执行：
   - 删除前端三处指向上游仓库的可点击 GitHub 入口——首页页脚、API Key 用量页页脚、登录后右上角下拉导航（该项仅管理员可见）；连带删除随之失效的 `githubUrl` 常量。
+  - 修正版本面板中提供给管理员复制执行的手动回滚命令：移除依赖上游 `deploy/install.sh` 的脚本回滚方式，容器回滚指引改用本仓库发布的 GHCR 镜像。原样保留会让管理员把实例换成上游构建。
   - 将后端在线更新的仓库常量由 `Wei-Shaw/sub2api` 改写为本仓库，使更新检测、版本回滚列表与产物下载全部回流到本仓库的 Release。
   - 每处改写前后都做断言：改前必须命中预期文本，改后必须清零，未命中即让流水线失败，不产出"漏改"的版本。
 - 复用上游 `.goreleaser.yaml` 完成打包（其发布目标已由 `GITHUB_REPO_OWNER` / `GITHUB_REPO_NAME` 环境变量参数化），产出与上游同构的 5 个二进制归档 + `checksums.txt`，并推送多架构 GHCR 镜像至 `ghcr.io/<owner>/sub2api`。
@@ -46,6 +47,7 @@
 | `frontend/src/views/HomeView.vue` | 删除页脚 GitHub 链接与 `githubUrl` 常量 |
 | `frontend/src/views/KeyUsageView.vue` | 同上 |
 | `frontend/src/components/layout/AppHeader.vue` | 删除下拉导航中的 GitHub 项 |
+| `frontend/src/components/common/VersionBadge.vue` | 删除脚本回滚方式，容器回滚镜像改为本仓库 GHCR 镜像 |
 | `backend/internal/service/update_service.go` | `githubRepo` 常量改为本仓库 |
 | `backend/cmd/server/VERSION` | 按发布 tag 写入版本号 |
 
