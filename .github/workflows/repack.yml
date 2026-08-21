@@ -57,8 +57,6 @@ jobs:
             exit 1
           fi
 
-          jq -r '.body // ""' "${RUNNER_TEMP}/upstream_release.json" > "${RUNNER_TEMP}/upstream_body.md"
-
           {
             echo "tag=${TAG}"
             echo "version=${TAG#v}"
@@ -182,29 +180,6 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Compose release notes
-        if: steps.idem.outputs.exists == 'false'
-        env:
-          TAG: ${{ steps.upstream.outputs.tag }}
-          UPSTREAM_COMMIT: ${{ steps.clone.outputs.commit }}
-        run: |
-          set -euo pipefail
-          DELIM="DEBRAND_EOF_${GITHUB_RUN_ID}"
-          {
-            echo "TAG_MESSAGE<<${DELIM}"
-            echo "> 本版本由自动流水线基于上游 [\`${UPSTREAM_REPO}\` ${TAG}](https://github.com/${UPSTREAM_REPO}/releases/tag/${TAG})（commit \`${UPSTREAM_COMMIT}\`）重新打包。"
-            echo ">"
-            echo "> - 已移除前端指向上游仓库的 GitHub 入口（首页页脚、用量页页脚、右上角下拉导航）"
-            echo "> - 在线更新检测、回滚列表与产物下载已改为指向本仓库"
-            echo "> - 改动内容见本仓库 \`scripts/debrand.py\`；上游以 LGPL-3.0 授权，归档内保留原始 LICENSE"
-            echo "> - 下方 \"One-line install\" 一键安装命令来自上游模板，本仓库不携带 \`deploy/\` 目录，该命令不适用"
-            echo ""
-            echo "---"
-            echo ""
-            cat "${RUNNER_TEMP}/upstream_body.md"
-            echo "${DELIM}"
-          } >> "$GITHUB_ENV"
-
       - name: Resolve repository identifiers
         id: repo
         if: steps.idem.outputs.exists == 'false'
@@ -229,6 +204,29 @@ jobs:
           GITHUB_REPO_OWNER_LOWER: ${{ steps.repo.outputs.owner_lower }}
           GITHUB_REPO_NAME: ${{ steps.repo.outputs.name }}
           DOCKERHUB_USERNAME: skip
+          # 上游的页眉模板引用了这个变量，缺失会让模板渲染直接报错。
+          # 置空即可；正文由下一步统一清掉。
+          TAG_MESSAGE: ""
+
+      # ---------- 发布后处理 ----------
+      - name: Clear release notes
+        if: steps.idem.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Release 正文来自上游打包配置里的页眉/页脚模板，其中的一键安装命令依赖
+          # 仓库内的 deploy/ 目录，本仓库不携带。发布后统一清空，而不是去改上游配置 ——
+          # 正文是纯外观诉求，不该获得「卡住发版」的权力。
+          gh release edit "${TAG}" --repo "${GITHUB_REPOSITORY}" --notes-file /dev/null
+
+          LEN=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" --jq '.body | length')
+          if [ "${LEN}" != "0" ]; then
+            echo "::error::Release 正文未能清空（当前 ${LEN} 字符）。产物已正常发布，重跑本步骤或手动执行 gh release edit --notes-file /dev/null 即可。"
+            exit 1
+          fi
+          echo "Release 正文已清空"
 
       # ---------- 发布后校验 ----------
       - name: Assert release assets
